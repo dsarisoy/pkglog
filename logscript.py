@@ -284,8 +284,6 @@ def run():
     ws_explicit.title = "Explicitly Downloaded"
     write_sheet(ws_explicit, explicit_rows, EXPLICIT_FILL)
 
-    ws_explicit["A1"].comment = comment
-
     ws_aur = wb.create_sheet("AUR")
     write_sheet(ws_aur, aur_rows, AUR_FILL)
 

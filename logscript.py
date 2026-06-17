@@ -256,36 +256,24 @@ def build_pkg_stats(events):
 def classify_packages(pkg_stats, official_pkgs, explicit_pkgs):
     """
     Returns:
-      explicit_pkgs_set  - set of pkg names: official + explicitly installed
-      aur_pkgs_set       - set of pkg names: not in official repos
-      official_dep_set   - set of pkg names: official + NOT explicitly installed
-                           AND not a dep of any explicit pkg
+      explicit_set   - official repo packages explicitly installed by the user
+      aur_set        - packages not in official repos (AUR/manual)
+      system_set     - official repo packages NOT explicitly installed (auto deps)
     """
-    # build dep map for explicit packages
-    print("  Resolving dependency trees (this may take a moment)...")
-    explicit_deps = set()
-    for pkg in explicit_pkgs:
-        for dep in get_deps_of(pkg):
-            explicit_deps.add(dep)
-
-    explicit_set     = set()
-    aur_set          = set()
-    official_dep_set = set()
+    explicit_set = set()
+    aur_set      = set()
+    system_set   = set()
 
     for pkg in pkg_stats:
         if pkg in official_pkgs:
             if pkg in explicit_pkgs:
                 explicit_set.add(pkg)
             else:
-                official_dep_set.add(pkg)
+                system_set.add(pkg)
         else:
             aur_set.add(pkg)
 
-    # official deps that are deps of explicit pkgs stay in official_dep_set
-    # only pkgs with NO explicit parent go to the "base/orphan" official deps sheet
-    orphan_official = official_dep_set - explicit_deps
-
-    return explicit_set, aur_set, official_dep_set, explicit_deps, orphan_official
+    return explicit_set, aur_set, system_set
 
 
 # ── xlsx helpers ──────────────────────────────────────────────────────────────
@@ -313,8 +301,7 @@ def write_summary_row(ws, r, values, row_fill, font=None):
 
 # ── summary sheets ─────────────────────────────────────────────────────────────
 
-def write_summary_sheet(ws, pkg_list, pkg_stats, official_pkgs, explicit_pkgs,
-                        explicit_deps, header_fill, parent_fill, show_deps=True):
+def write_summary_sheet(ws, pkg_list, pkg_stats, header_fill, parent_fill, show_deps=True):
     """
     One row per package (sorted by last_updated desc), with dependency rows
     indented underneath each parent.
@@ -401,10 +388,10 @@ def run(include_history=True):
     print(f"  {len(events)} events, {len(pkg_stats)} unique packages")
 
     print("Classifying packages...")
-    explicit_set, aur_set, official_dep_set, explicit_deps, orphan_official = \
+    explicit_set, aur_set, system_set = \
         classify_packages(pkg_stats, official_pkgs, explicit_pkgs)
     print(f"  {len(explicit_set)} explicit, {len(aur_set)} AUR, "
-          f"{len(orphan_official)} orphan official deps")
+          f"{len(system_set)} system packages")
 
     print("Fetching package info (versions + dependencies)...")
     all_pkgs = set(pkg_stats.keys())
@@ -417,31 +404,28 @@ def run(include_history=True):
     # ── summary sheets ──
     ws_explicit = wb.active
     ws_explicit.title = "Official Repository"
-    write_summary_sheet(ws_explicit, explicit_set, pkg_stats, official_pkgs,
-                        explicit_pkgs, explicit_deps, EXPLICIT_FILL,
-                        PARENT_EXPLICIT_FILL, show_deps=True)
+    write_summary_sheet(ws_explicit, explicit_set, pkg_stats,
+                        EXPLICIT_FILL, PARENT_EXPLICIT_FILL, show_deps=True)
     c = Comment(
         "Removed packages will not appear here — pacman -Qqe only tracks currently "
-        "installed packages. Check History: Explicit for removed package events.",
+        "installed packages. Check History Official Repo for removed package events.",
         "pkglog"
     )
     ws_explicit["A1"].comment = c
 
     ws_aur = wb.create_sheet("AUR")
-    write_summary_sheet(ws_aur, aur_set, pkg_stats, official_pkgs,
-                        explicit_pkgs, explicit_deps, AUR_FILL,
-                        PARENT_AUR_FILL, show_deps=True)
+    write_summary_sheet(ws_aur, aur_set, pkg_stats,
+                        AUR_FILL, PARENT_AUR_FILL, show_deps=True)
 
-    ws_official = wb.create_sheet("System Packages")
-    write_summary_sheet(ws_official, orphan_official, pkg_stats, official_pkgs,
-                        explicit_pkgs, explicit_deps, OFFICIAL_FILL,
-                        PARENT_OFFICIAL_FILL, show_deps=False)
+    ws_system = wb.create_sheet("System Packages")
+    write_summary_sheet(ws_system, system_set, pkg_stats,
+                        OFFICIAL_FILL, PARENT_OFFICIAL_FILL, show_deps=False)
 
     # ── history sheets ──
     if include_history:
         explicit_events = [e for e in events if e["package"] in explicit_set]
         aur_events      = [e for e in events if e["package"] in aur_set]
-        official_events = [e for e in events if e["package"] in official_dep_set]
+        official_events = [e for e in events if e["package"] in system_set]
 
         ws_hist_explicit = wb.create_sheet("History Official Repo")
         write_history_sheet(ws_hist_explicit, explicit_events, HIST_EXPLICIT_FILL)
@@ -485,5 +469,5 @@ Row colors in the spreadsheet:
 Dependency rows appear indented under their parent package
 and use a lighter shade of the same color.
 """)
-        ans = input("\nGenerate Pacman/AUR history sheets? This will take more time. [y/N]: ").strip().lower()
+        ans = input("Generate per-category history sheets? This will take more time. [y/N]: ").strip().lower()
         run(include_history=(ans == "y"))

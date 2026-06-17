@@ -2,6 +2,10 @@
 A package history tracker for Arch Linux. Parses `/var/log/pacman.log` and generates a formatted `.xlsx` spreadsheet with a full record of every package ever installed, updated, or removed on your system — broken out by source.
 Useful for auditing your system after security incidents like the [June 2026 AUR supply-chain attack](https://www.privacyguides.org/news/2026/06/12/around-1-500-aur-packages-compromised-with-rootkit-like-malware/).
 ---
+## Preview
+
+![pkglog spreadsheet preview](preview.png)
+
 ## Sheets
 | Sheet | Contents |
 |---|---|

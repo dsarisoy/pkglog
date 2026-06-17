@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-logscript.py - Arch Linux package history tracker
+pkglog.py - Arch Linux package history tracker
 
 Parses /var/log/pacman.log and writes a multi-sheet xlsx to ~/Scripts/pkglog.xlsx
 
@@ -11,8 +11,8 @@ Sheets:
   History              - every install/upgrade/remove event, one row per event
 
 Usage:
-  python3 logscript.py           # generate / refresh the spreadsheet
-  python3 logscript.py --setup   # first-time setup: install hook + generate spreadsheet
+  python3 pkglog.py           # generate / refresh the spreadsheet
+  python3 pkglog.py --setup   # first-time setup: install hook + generate spreadsheet
 """
 
 import re
@@ -30,6 +30,7 @@ try:
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
+    from openpyxl.comments import Comment
 except ImportError:
     print("Error: openpyxl is not installed.")
     print("Install it with:  sudo pacman -S python-openpyxl")
@@ -177,24 +178,19 @@ def parse_log():
 
 
 def build_package_summary(events, official_pkgs, explicit_pkgs):
-    pkg_events = defaultdict(list)
-    for e in events:
-        pkg_events[e["package"]].append(e)
-
     explicit, aur, official_deps = [], [], []
 
-    for pkg, evts in sorted(pkg_events.items()):
-        pkg_evts_sorted = sorted(evts, key=lambda e: e["datetime"])
-
+    for e in events:
+        pkg = e["package"]
         if pkg in official_pkgs:
             if pkg in explicit_pkgs:
-                explicit.append(pkg_evts_sorted)
+                explicit.append(e)
             else:
-                official_deps.append(pkg_evts_sorted)
+                official_deps.append(e)
         else:
-            aur.append(pkg_evts_sorted)
+            aur.append(e)
 
-    return explicit, aur, official_deps
+    return list(reversed(explicit)), list(reversed(aur)), list(reversed(official_deps))
 
 
 # - xlsx writing -
@@ -209,7 +205,7 @@ def style_header(ws, headers, fill):
     ws.row_dimensions[1].height = 28
 
 
-def write_sheet(ws, pkg_event_lists, header_fill):
+def write_sheet(ws, events, header_fill):
     headers = ["Date", "Time", "Action", "Package", "Version / Change"]
     style_header(ws, headers, header_fill)
 
@@ -218,20 +214,17 @@ def write_sheet(ws, pkg_event_lists, header_fill):
 
     ws.freeze_panes = "A2"
 
-    r = 2
-    for evts in pkg_event_lists:
-        for e in evts:
-            c = ACTION_COLORS.get(e["action"], "FFFFFF")
-            rf = PatternFill("solid", start_color=c, end_color=c)
-            for col, val in enumerate(
-                [e["date"], e["time"], e["action"], e["package"], e["version"]], 1
-            ):
-                cell           = ws.cell(row=r, column=col, value=val)
-                cell.font      = BODY_FONT
-                cell.fill      = rf
-                cell.border    = BORDER
-                cell.alignment = Alignment(vertical="center")
-            r += 1
+    for r, e in enumerate(events, 2):
+        c = ACTION_COLORS.get(e["action"], "FFFFFF")
+        rf = PatternFill("solid", start_color=c, end_color=c)
+        for col, val in enumerate(
+            [e["date"], e["time"], e["action"], e["package"], e["version"]], 1
+        ):
+            cell           = ws.cell(row=r, column=col, value=val)
+            cell.font      = BODY_FONT
+            cell.fill      = rf
+            cell.border    = BORDER
+            cell.alignment = Alignment(vertical="center")
 
 
 def write_history_sheet(ws, events):
@@ -276,13 +269,18 @@ def run():
     explicit_rows, aur_rows, official_dep_rows = build_package_summary(
         events, official_pkgs, explicit_pkgs
     )
-    print(f"  {len(explicit_rows)} explicit, {len(aur_rows)} AUR, {len(official_dep_rows)} official dependencies")
+    print(f"  {len(explicit_rows)} explicit events, {len(aur_rows)} AUR events, {len(official_dep_rows)} official dependency events")
 
     wb = Workbook()
 
     ws_explicit = wb.active
     ws_explicit.title = "Explicitly Downloaded"
     write_sheet(ws_explicit, explicit_rows, EXPLICIT_FILL)
+    comment = Comment(
+        "Removed packages will not appear here — pacman -Qqe only tracks currently installed packages. Check the History sheet for removed package events.",
+        "pkglog"
+    )
+    ws_explicit["A1"].comment = comment
 
     ws_aur = wb.create_sheet("AUR")
     write_sheet(ws_aur, aur_rows, AUR_FILL)
@@ -291,7 +289,7 @@ def run():
     write_sheet(ws_official, official_dep_rows, OFFICIAL_FILL)
 
     ws_history = wb.create_sheet("History")
-    write_history_sheet(ws_history, events)
+    write_history_sheet(ws_history, list(reversed(events)))
 
     wb.save(OUT_PATH)
     print(f"Saved - {OUT_PATH}")

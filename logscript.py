@@ -167,32 +167,47 @@ def get_explicit_packages():
         return set()
 
 
-def get_deps_of(pkg):
-    """Return list of direct dependencies of pkg using pacman -Qi."""
+def batch_pkg_info(pkg_list):
+    """
+    Run a single pacman -Qi call for all packages and return a dict:
+      { pkg_name: { "version": str, "deps": [str] } }
+    """
+    if not pkg_list:
+        return {}
     try:
-        r = subprocess.run(["pacman", "-Qi", pkg], capture_output=True, text=True, timeout=10)
-        for line in r.stdout.splitlines():
-            if line.startswith("Depends On"):
-                val = line.split(":", 1)[1].strip()
-                if val == "None":
-                    return []
-                # strip version constraints e.g. glibc>=2.17
-                deps = re.split(r"\s+", val)
-                return [re.split(r"[><=]", d)[0] for d in deps if d]
-        return []
+        r = subprocess.run(
+            ["pacman", "-Qi"] + list(pkg_list),
+            capture_output=True, text=True, timeout=60
+        )
     except Exception:
-        return []
+        return {}
+
+    info = {}
+    current = None
+    for line in r.stdout.splitlines():
+        if line.startswith("Name"):
+            current = line.split(":", 1)[1].strip()
+            info[current] = {"version": "", "deps": []}
+        elif current and line.startswith("Version"):
+            info[current]["version"] = line.split(":", 1)[1].strip()
+        elif current and line.startswith("Depends On"):
+            val = line.split(":", 1)[1].strip()
+            if val != "None":
+                deps = re.split(r"\s+", val)
+                info[current]["deps"] = [re.split(r"[><=]", d)[0] for d in deps if d]
+    return info
+
+
+# module-level cache populated once per run
+_PKG_INFO_CACHE = {}
+
+
+def get_deps_of(pkg):
+    return _PKG_INFO_CACHE.get(pkg, {}).get("deps", [])
 
 
 def get_current_version(pkg):
-    try:
-        r = subprocess.run(["pacman", "-Qi", pkg], capture_output=True, text=True, timeout=10)
-        for line in r.stdout.splitlines():
-            if line.startswith("Version"):
-                return line.split(":", 1)[1].strip()
-        return ""
-    except Exception:
-        return ""
+    return _PKG_INFO_CACHE.get(pkg, {}).get("version", "")
 
 
 def parse_log():
@@ -390,6 +405,12 @@ def run(include_history=True):
         classify_packages(pkg_stats, official_pkgs, explicit_pkgs)
     print(f"  {len(explicit_set)} explicit, {len(aur_set)} AUR, "
           f"{len(orphan_official)} orphan official deps")
+
+    print("Fetching package info (versions + dependencies)...")
+    all_pkgs = set(pkg_stats.keys())
+    global _PKG_INFO_CACHE
+    _PKG_INFO_CACHE = batch_pkg_info(all_pkgs)
+    print(f"  {len(_PKG_INFO_CACHE)} packages queried")
 
     wb = Workbook()
 

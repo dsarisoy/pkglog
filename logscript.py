@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-pkglog.py - Arch Linux package history tracker
+pkglog - Arch Linux package history tracker
 
-Parses /var/log/pacman.log and writes a multi-sheet xlsx to ~/Scripts/pkglog.xlsx
+Parses /var/log/pacman.log and writes a multi-sheet ods to /var/log/pkglog/pkglog.ods
 
 Sheets:
-  Explicitly Downloaded  - one row per explicit package + indented deps, sorted by last updated
-  AUR                   - one row per AUR package + indented deps, sorted by last updated
-  Official Dependencies  - base/orphan packages not pulled in by any explicit install
-  History: Explicit      - flat chronological log for explicit packages
-  History: AUR           - flat chronological log for AUR packages
-  History: Official      - flat chronological log for official dependencies
-  History                - full log of every pacman event
+  Official Repository   - one row per explicit package + indented deps, sorted by last updated
+  AUR                  - one row per AUR package + indented deps, sorted by last updated
+  System Packages      - auto-installed dependencies from official repos
+  History Official Repo - flat chronological log for explicit packages
+  History AUR          - flat chronological log for AUR packages
+  History System       - flat chronological log for system packages
+  History              - full log of every pacman event
 
 Usage:
-  python3 pkglog.py           # generate / refresh the spreadsheet
-  python3 pkglog.py --setup   # first-time setup: install hook + generate spreadsheet
+  pkglog           # generate / refresh the spreadsheet
+  pkglog --setup   # first-time setup: install script + hook + generate spreadsheet
 """
 
 import re
@@ -28,23 +28,27 @@ from pathlib import Path
 from collections import defaultdict
 
 try:
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    from openpyxl.utils import get_column_letter
-    from openpyxl.comments import Comment
+    from odf.opendocument import OpenDocumentSpreadsheet
+    from odf.table import Table, TableRow, TableCell, TableColumn
+    from odf.style import (Style, TextProperties, TableCellProperties,
+                           TableColumnProperties, TableRowProperties)
+    from odf.text import P
+    from odf.namespaces import OFFICENS
+    from odf import teletype
 except ImportError:
-    print("Error: openpyxl is not installed.")
-    print("Install it with:  sudo pacman -S python-openpyxl")
+    print("Error: odfpy is not installed.")
+    print("Install it with:  sudo pacman -S python-odfpy")
     sys.exit(1)
 
-SCRIPT_PATH = Path(__file__).resolve()
-SCRIPT_DIR  = SCRIPT_PATH.parent
-LOG_PATH    = Path("/var/log/pacman.log")
-OUT_PATH    = SCRIPT_DIR / "pkglog.xlsx"
+PACMAN_LOG  = Path("/var/log/pacman.log")
+OUT_DIR     = Path("/var/log/pkglog")
+OUT_PATH    = OUT_DIR / "pkglog.ods"
 HOOK_DIR    = Path("/etc/pacman.d/hooks")
 HOOK_PATH   = HOOK_DIR / "pkglog.hook"
+INSTALL_BIN = Path("/usr/local/bin/pkglog")
+SCRIPT_PATH = Path(__file__).resolve()
 
-HOOK_CONTENT = f"""\
+HOOK_CONTENT = """\
 [Trigger]
 Operation = Install
 Operation = Upgrade
@@ -55,7 +59,7 @@ Target = *
 [Action]
 Description = Updating pkglog package history...
 When = PostTransaction
-Exec = /usr/bin/python3 {SCRIPT_PATH}
+Exec = /usr/local/bin/pkglog
 """
 
 LOG_RE = re.compile(
@@ -63,52 +67,58 @@ LOG_RE = re.compile(
     r"(installed|upgraded|removed|reinstalled) ([^\s]+) \((.+)\)$"
 )
 
-# header fills
-EXPLICIT_FILL      = PatternFill("solid", start_color="1F4E79", end_color="1F4E79")
-AUR_FILL           = PatternFill("solid", start_color="375623", end_color="375623")
-OFFICIAL_FILL      = PatternFill("solid", start_color="4A235A", end_color="4A235A")
-HIST_EXPLICIT_FILL = PatternFill("solid", start_color="2E75B6", end_color="2E75B6")
-HIST_AUR_FILL      = PatternFill("solid", start_color="548235", end_color="548235")
-HIST_OFFICIAL_FILL = PatternFill("solid", start_color="7030A0", end_color="7030A0")
-HISTORY_FILL       = PatternFill("solid", start_color="7B3F00", end_color="7B3F00")
-
-# row fills
-PARENT_EXPLICIT_FILL = PatternFill("solid", start_color="BDD7EE", end_color="BDD7EE")
-PARENT_AUR_FILL      = PatternFill("solid", start_color="C6EFCE", end_color="C6EFCE")
-PARENT_OFFICIAL_FILL = PatternFill("solid", start_color="E2CFEE", end_color="E2CFEE")
-DEP_FILL             = PatternFill("solid", start_color="F2F2F2", end_color="F2F2F2")
-
-HEADER_FONT = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-BODY_FONT   = Font(name="Arial", size=10)
-DEP_FONT    = Font(name="Arial", size=10, italic=True, color="666666")
-
-thin   = Side(style="thin", color="CCCCCC")
-BORDER = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-ACTION_COLORS = {
+# Colors (hex without #)
+COLORS = {
     "installed":   "C6EFCE",
     "upgraded":    "DDEBF7",
     "reinstalled": "FFF2CC",
     "removed":     "FFCCCC",
 }
 
+HEADER_COLORS = {
+    "Official Repository":  "1F4E79",
+    "AUR":                  "375623",
+    "System Packages":      "4A235A",
+    "History Official Repo":"2E75B6",
+    "History AUR":          "548235",
+    "History System":       "7030A0",
+    "History":              "7B3F00",
+}
+
 SUMMARY_COLS   = ["Last Updated", "Package", "First Installed", "Total Updates", "Current Version"]
-SUMMARY_WIDTHS = [16, 32, 16, 14, 20]
+SUMMARY_WIDTHS = [3.2, 6.4, 3.2, 2.8, 4.0]  # in cm
 HISTORY_COLS   = ["Date", "Time", "Action", "Package", "Version / Change"]
-HISTORY_WIDTHS = [14, 10, 14, 30, 40]
+HISTORY_WIDTHS = [2.8, 2.0, 2.8, 6.0, 8.0]
+
+_PKG_INFO_CACHE = {}
 
 
-# ── setup ────────────────────────────────────────────────────────────────────
+# ── setup ─────────────────────────────────────────────────────────────────────
 
 def check_dependencies():
     ok = True
     if not shutil.which("pacman"):
         print("Error: pacman not found. pkglog requires Arch Linux.")
         ok = False
-    if not LOG_PATH.exists():
-        print(f"Error: {LOG_PATH} not found.")
+    if not PACMAN_LOG.exists():
+        print(f"Error: {PACMAN_LOG} not found.")
         ok = False
     return ok
+
+
+def install_script():
+    if INSTALL_BIN.exists() and INSTALL_BIN.resolve() == SCRIPT_PATH:
+        print(f"Script already installed at {INSTALL_BIN}")
+        return True
+    print(f"Installing pkglog to {INSTALL_BIN} (requires sudo)...")
+    try:
+        subprocess.run(["sudo", "cp", str(SCRIPT_PATH), str(INSTALL_BIN)], check=True)
+        subprocess.run(["sudo", "chmod", "755", str(INSTALL_BIN)], check=True)
+        print(f"Script installed - {INSTALL_BIN}")
+        return True
+    except subprocess.CalledProcessError:
+        print(f"Failed to install script to {INSTALL_BIN}.")
+        return False
 
 
 def install_hook():
@@ -137,6 +147,7 @@ def setup():
     print("=== pkglog setup ===\n")
     if not check_dependencies():
         sys.exit(1)
+    install_script()
     hook_ok = install_hook()
     print("\nGenerating initial spreadsheet...")
     run()
@@ -149,7 +160,7 @@ def setup():
         print("\nHook installation failed - auto-update won't work until the hook is installed.")
 
 
-# ── data gathering ────────────────────────────────────────────────────────────
+# ── data gathering ─────────────────────────────────────────────────────────────
 
 def get_official_packages():
     try:
@@ -168,10 +179,6 @@ def get_explicit_packages():
 
 
 def batch_pkg_info(pkg_list):
-    """
-    Run a single pacman -Qi call for all packages and return a dict:
-      { pkg_name: { "version": str, "deps": [str] } }
-    """
     if not pkg_list:
         return {}
     try:
@@ -198,10 +205,6 @@ def batch_pkg_info(pkg_list):
     return info
 
 
-# module-level cache populated once per run
-_PKG_INFO_CACHE = {}
-
-
 def get_deps_of(pkg):
     return _PKG_INFO_CACHE.get(pkg, {}).get("deps", [])
 
@@ -212,7 +215,7 @@ def get_current_version(pkg):
 
 def parse_log():
     events = []
-    with open(LOG_PATH, "r", errors="replace") as f:
+    with open(PACMAN_LOG, "r", errors="replace") as f:
         for line in f:
             m = LOG_RE.match(line.rstrip())
             if not m:
@@ -230,7 +233,6 @@ def parse_log():
 
 
 def build_pkg_stats(events):
-    """Build per-package stats dict from log events."""
     stats = defaultdict(lambda: {
         "first_installed": None,
         "last_updated":    None,
@@ -254,16 +256,9 @@ def build_pkg_stats(events):
 
 
 def classify_packages(pkg_stats, official_pkgs, explicit_pkgs):
-    """
-    Returns:
-      explicit_set   - official repo packages explicitly installed by the user
-      aur_set        - packages not in official repos (AUR/manual)
-      system_set     - official repo packages NOT explicitly installed (auto deps)
-    """
     explicit_set = set()
     aur_set      = set()
     system_set   = set()
-
     for pkg in pkg_stats:
         if pkg in official_pkgs:
             if pkg in explicit_pkgs:
@@ -272,107 +267,162 @@ def classify_packages(pkg_stats, official_pkgs, explicit_pkgs):
                 system_set.add(pkg)
         else:
             aur_set.add(pkg)
-
     return explicit_set, aur_set, system_set
 
 
-# ── xlsx helpers ──────────────────────────────────────────────────────────────
+# ── ods helpers ────────────────────────────────────────────────────────────────
 
-def style_header(ws, headers, widths, fill):
-    for col, (h, w) in enumerate(zip(headers, widths), 1):
-        cell = ws.cell(row=1, column=col, value=h)
-        cell.font      = HEADER_FONT
-        cell.fill      = fill
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border    = BORDER
-        ws.column_dimensions[get_column_letter(col)].width = w
-    ws.row_dimensions[1].height = 28
-    ws.freeze_panes = "A2"
+def hex_to_rgb(h):
+    return f"#{h}"
 
 
-def write_summary_row(ws, r, values, row_fill, font=None):
-    for col, val in enumerate(values, 1):
-        cell           = ws.cell(row=r, column=col, value=val)
-        cell.font      = font or BODY_FONT
-        cell.fill      = row_fill
-        cell.border    = BORDER
-        cell.alignment = Alignment(vertical="center")
+def style_id(sheet_name):
+    """Convert sheet name to a valid XML style name (no spaces or special chars)."""
+    return sheet_name.replace(" ", "_").replace(":", "_")
 
 
-# ── summary sheets ─────────────────────────────────────────────────────────────
+def make_style(doc, name, bg_hex, bold=False, italic=False,
+               font_color="000000", font_size="10pt", border=True):
+    style = Style(name=name, family="table-cell")
+    style.addElement(TableCellProperties(
+        backgroundcolor=hex_to_rgb(bg_hex),
+        border="0.05pt solid #CCCCCC" if border else "none",
+        padding="0.05cm",
+    ))
+    tp_kwargs = dict(fontsize=font_size, color=hex_to_rgb(font_color))
+    if bold:
+        tp_kwargs["fontweight"] = "bold"
+    if italic:
+        tp_kwargs["fontstyle"] = "italic"
+    style.addElement(TextProperties(**tp_kwargs))
+    doc.automaticstyles.addElement(style)
+    return name
 
-def write_summary_sheet(ws, pkg_list, pkg_stats, header_fill, parent_fill, show_deps=True):
-    """
-    One row per package (sorted by last_updated desc), with dependency rows
-    indented underneath each parent.
-    """
-    style_header(ws, SUMMARY_COLS, SUMMARY_WIDTHS, header_fill)
 
-    # sort packages by last_updated descending
+def make_col_style(doc, name, width_cm):
+    style = Style(name=name, family="table-column")
+    style.addElement(TableColumnProperties(columnwidth=f"{width_cm}cm"))
+    doc.automaticstyles.addElement(style)
+    return name
+
+
+def make_row_style(doc, name, height_cm="0.7"):
+    style = Style(name=name, family="table-row")
+    style.addElement(TableRowProperties(rowheight=f"{height_cm}cm",
+                                        useoptimalrowheight="false"))
+    doc.automaticstyles.addElement(style)
+    return name
+
+
+def add_cell(row, style_name, value, doc):
+    cell = TableCell(stylename=style_name, valuetype="string")
+    cell.addElement(P(text=str(value) if value is not None else ""))
+    row.addElement(cell)
+
+
+def register_sheet_styles(doc, sheet_name, col_widths, rows_data, header_color):
+    """Pre-register all styles for a sheet before any tables are created."""
+    for i, w in enumerate(col_widths):
+        cs = Style(name=f"{style_id(sheet_name)}_col{i}", family="table-column")
+        cs.addElement(TableColumnProperties(columnwidth=f"{w}cm"))
+        doc.automaticstyles.addElement(cs)
+
+    hrs = Style(name=f"{style_id(sheet_name)}_hrow", family="table-row")
+    hrs.addElement(TableRowProperties(rowheight="0.8cm", useoptimalrowheight="false"))
+    doc.automaticstyles.addElement(hrs)
+
+    rs = Style(name=f"{style_id(sheet_name)}_row", family="table-row")
+    rs.addElement(TableRowProperties(rowheight="0.7cm", useoptimalrowheight="false"))
+    doc.automaticstyles.addElement(rs)
+
+    make_style(doc, f"{style_id(sheet_name)}_header", header_color, bold=True, font_color="FFFFFF")
+
+    seen = set()
+    for _, bg_hex, is_dep in rows_data:
+        key = (bg_hex, is_dep)
+        if key not in seen:
+            seen.add(key)
+            font_color = "666666" if is_dep else "000000"
+            make_style(doc, f"{style_id(sheet_name)}_c_{bg_hex}_{int(is_dep)}",
+                       bg_hex, italic=is_dep, font_color=font_color)
+
+
+def write_sheet(doc, sheet_name, col_names, col_widths, rows_data, header_color):
+    table = Table(name=sheet_name)
+
+    for i in range(len(col_widths)):
+        table.addElement(TableColumn(stylename=f"{style_id(sheet_name)}_col{i}"))
+
+    hrow = TableRow(stylename=f"{style_id(sheet_name)}_hrow")
+    for col in col_names:
+        add_cell(hrow, f"{style_id(sheet_name)}_header", col, doc)
+    table.addElement(hrow)
+
+    for row_vals, bg_hex, is_dep in rows_data:
+        sname = f"{style_id(sheet_name)}_c_{bg_hex}_{int(is_dep)}"
+        tr = TableRow(stylename=f"{style_id(sheet_name)}_row")
+        for val in row_vals:
+            add_cell(tr, sname, val, doc)
+        table.addElement(tr)
+
+    doc.spreadsheet.addElement(table)
+
+
+# ── sheet builders ─────────────────────────────────────────────────────────────
+
+def lighten(hex_color, amount=40):
+    r = min(255, int(hex_color[0:2], 16) + amount)
+    g = min(255, int(hex_color[2:4], 16) + amount)
+    b = min(255, int(hex_color[4:6], 16) + amount)
+    return f"{r:02x}{g:02x}{b:02x}"
+
+
+def build_summary_rows(pkg_list, pkg_stats, show_deps):
     def sort_key(pkg):
         lu = pkg_stats[pkg]["last_updated"]
         return lu if lu else "0000-00-00"
 
-    sorted_pkgs = sorted(pkg_list, key=sort_key, reverse=True)
-
-    r = 2
-    for pkg in sorted_pkgs:
+    rows = []
+    for pkg in sorted(pkg_list, key=sort_key, reverse=True):
         s       = pkg_stats[pkg]
         version = get_current_version(pkg)
         lu      = s["last_updated"] or s["first_installed"] or ""
         fi      = s["first_installed"] or ""
         tu      = s["total_updates"]
-
-        # parent row — color by last action
-        action_color = ACTION_COLORS.get(s.get("last_action", "installed"), "C6EFCE")
-        pkg_fill = PatternFill("solid", start_color=action_color, end_color=action_color)
-        write_summary_row(ws, r, [lu, pkg, fi, tu, version], pkg_fill)
-        r += 1
+        color   = COLORS.get(s.get("last_action", "installed"), "C6EFCE")
+        rows.append(([lu, pkg, fi, tu, version], color, False))
 
         if show_deps:
-            deps = get_deps_of(pkg)
-            for dep in sorted(deps):
+            for dep in sorted(get_deps_of(pkg)):
                 if dep not in pkg_stats:
                     continue
-                ds           = pkg_stats[dep]
-                dver         = get_current_version(dep)
-                dlu          = ds["last_updated"] or ds["first_installed"] or ""
-                dfi          = ds["first_installed"] or ""
-                dtu          = ds["total_updates"]
-                dep_action   = ds.get("last_action", "installed")
-                dep_color    = ACTION_COLORS.get(dep_action, "C6EFCE")
-                # blend dep color lighter by mixing with white
-                r_hex = hex(min(255, int(dep_color[0:2], 16) + 40))[2:].zfill(2)
-                g_hex = hex(min(255, int(dep_color[2:4], 16) + 40))[2:].zfill(2)
-                b_hex = hex(min(255, int(dep_color[4:6], 16) + 40))[2:].zfill(2)
-                light_color = r_hex + g_hex + b_hex
-                dep_fill = PatternFill("solid", start_color=light_color, end_color=light_color)
-                write_summary_row(ws, r, [dlu, f"  └ {dep}", dfi, dtu, dver],
-                                  dep_fill, DEP_FONT)
-                r += 1
+                ds    = pkg_stats[dep]
+                dver  = get_current_version(dep)
+                dlu   = ds["last_updated"] or ds["first_installed"] or ""
+                dfi   = ds["first_installed"] or ""
+                dtu   = ds["total_updates"]
+                dcol  = lighten(COLORS.get(ds.get("last_action", "installed"), "C6EFCE"))
+                rows.append(([dlu, f"  \u2514 {dep}", dfi, dtu, dver], dcol, True))
+    return rows
 
 
-# ── history sheets ─────────────────────────────────────────────────────────────
-
-def write_history_sheet(ws, events, header_fill):
-    style_header(ws, HISTORY_COLS, HISTORY_WIDTHS, header_fill)
-    for r, e in enumerate(reversed(events), 2):
-        c  = ACTION_COLORS.get(e["action"], "FFFFFF")
-        rf = PatternFill("solid", start_color=c, end_color=c)
-        for col, val in enumerate(
-            [e["date"], e["time"], e["action"], e["package"], e["version"]], 1
-        ):
-            cell           = ws.cell(row=r, column=col, value=val)
-            cell.font      = BODY_FONT
-            cell.fill      = rf
-            cell.border    = BORDER
-            cell.alignment = Alignment(vertical="center")
+def build_history_rows(events):
+    rows = []
+    for e in reversed(events):
+        color = COLORS.get(e["action"], "FFFFFF")
+        rows.append((
+            [e["date"], e["time"], e["action"], e["package"], e["version"]],
+            color, False
+        ))
+    return rows
 
 
 # ── main ───────────────────────────────────────────────────────────────────────
 
 def run(include_history=True):
-    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if not OUT_DIR.exists():
+        subprocess.run(["sudo", "mkdir", "-p", str(OUT_DIR)], check=True)
+        subprocess.run(["sudo", "chmod", "777", str(OUT_DIR)], check=True)
 
     print("Reading official package list from pacman...")
     official_pkgs = get_official_packages()
@@ -382,7 +432,7 @@ def run(include_history=True):
     explicit_pkgs = get_explicit_packages()
     print(f"  {len(explicit_pkgs)} explicitly installed packages")
 
-    print(f"Parsing {LOG_PATH}...")
+    print(f"Parsing {PACMAN_LOG}...")
     events    = parse_log()
     pkg_stats = build_pkg_stats(events)
     print(f"  {len(events)} events, {len(pkg_stats)} unique packages")
@@ -394,52 +444,48 @@ def run(include_history=True):
           f"{len(system_set)} system packages")
 
     print("Fetching package info (versions + dependencies)...")
-    all_pkgs = set(pkg_stats.keys())
     global _PKG_INFO_CACHE
-    _PKG_INFO_CACHE = batch_pkg_info(all_pkgs)
+    _PKG_INFO_CACHE = batch_pkg_info(set(pkg_stats.keys()))
     print(f"  {len(_PKG_INFO_CACHE)} packages queried")
 
-    wb = Workbook()
+    print("Building spreadsheet...")
+    doc = OpenDocumentSpreadsheet()
 
-    # ── summary sheets ──
-    ws_explicit = wb.active
-    ws_explicit.title = "Official Repository"
-    write_summary_sheet(ws_explicit, explicit_set, pkg_stats,
-                        EXPLICIT_FILL, PARENT_EXPLICIT_FILL, show_deps=True)
-    c = Comment(
-        "Removed packages will not appear here — pacman -Qqe only tracks currently "
-        "installed packages. Check History Official Repo for removed package events.",
-        "pkglog"
-    )
-    ws_explicit["A1"].comment = c
+    # pre-build all row data
+    exp_rows    = build_summary_rows(explicit_set, pkg_stats, show_deps=True)
+    aur_rows    = build_summary_rows(aur_set, pkg_stats, show_deps=True)
+    sys_rows    = build_summary_rows(system_set, pkg_stats, show_deps=False)
+    hist_rows   = build_history_rows(events)
 
-    ws_aur = wb.create_sheet("AUR")
-    write_summary_sheet(ws_aur, aur_set, pkg_stats,
-                        AUR_FILL, PARENT_AUR_FILL, show_deps=True)
-
-    ws_system = wb.create_sheet("System Packages")
-    write_summary_sheet(ws_system, system_set, pkg_stats,
-                        OFFICIAL_FILL, PARENT_OFFICIAL_FILL, show_deps=False)
-
-    # ── history sheets ──
     if include_history:
         explicit_events = [e for e in events if e["package"] in explicit_set]
         aur_events      = [e for e in events if e["package"] in aur_set]
         official_events = [e for e in events if e["package"] in system_set]
+        hist_exp_rows   = build_history_rows(explicit_events)
+        hist_aur_rows   = build_history_rows(aur_events)
+        hist_sys_rows   = build_history_rows(official_events)
 
-        ws_hist_explicit = wb.create_sheet("History Official Repo")
-        write_history_sheet(ws_hist_explicit, explicit_events, HIST_EXPLICIT_FILL)
+    # register ALL styles before creating any tables
+    register_sheet_styles(doc, "Official Repository", SUMMARY_WIDTHS, exp_rows,  HEADER_COLORS["Official Repository"])
+    register_sheet_styles(doc, "AUR",                 SUMMARY_WIDTHS, aur_rows,  HEADER_COLORS["AUR"])
+    register_sheet_styles(doc, "System Packages",     SUMMARY_WIDTHS, sys_rows,  HEADER_COLORS["System Packages"])
+    if include_history:
+        register_sheet_styles(doc, "History Official Repo", HISTORY_WIDTHS, hist_exp_rows, HEADER_COLORS["History Official Repo"])
+        register_sheet_styles(doc, "History AUR",           HISTORY_WIDTHS, hist_aur_rows, HEADER_COLORS["History AUR"])
+        register_sheet_styles(doc, "History System",        HISTORY_WIDTHS, hist_sys_rows, HEADER_COLORS["History System"])
+    register_sheet_styles(doc, "History", HISTORY_WIDTHS, hist_rows, HEADER_COLORS["History"])
 
-        ws_hist_aur = wb.create_sheet("History AUR")
-        write_history_sheet(ws_hist_aur, aur_events, HIST_AUR_FILL)
+    # now write all tables
+    write_sheet(doc, "Official Repository", SUMMARY_COLS, SUMMARY_WIDTHS, exp_rows,  HEADER_COLORS["Official Repository"])
+    write_sheet(doc, "AUR",                 SUMMARY_COLS, SUMMARY_WIDTHS, aur_rows,  HEADER_COLORS["AUR"])
+    write_sheet(doc, "System Packages",     SUMMARY_COLS, SUMMARY_WIDTHS, sys_rows,  HEADER_COLORS["System Packages"])
+    if include_history:
+        write_sheet(doc, "History Official Repo", HISTORY_COLS, HISTORY_WIDTHS, hist_exp_rows, HEADER_COLORS["History Official Repo"])
+        write_sheet(doc, "History AUR",           HISTORY_COLS, HISTORY_WIDTHS, hist_aur_rows, HEADER_COLORS["History AUR"])
+        write_sheet(doc, "History System",        HISTORY_COLS, HISTORY_WIDTHS, hist_sys_rows, HEADER_COLORS["History System"])
+    write_sheet(doc, "History", HISTORY_COLS, HISTORY_WIDTHS, hist_rows, HEADER_COLORS["History"])
 
-        ws_hist_official = wb.create_sheet("History System")
-        write_history_sheet(ws_hist_official, official_events, HIST_OFFICIAL_FILL)
-
-    ws_history = wb.create_sheet("History")
-    write_history_sheet(ws_history, events, HISTORY_FILL)
-
-    wb.save(OUT_PATH)
+    doc.save(str(OUT_PATH))
     print(f"Saved - {OUT_PATH}")
 
 
@@ -450,7 +496,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--setup",
         action="store_true",
-        help="First-time setup: install pacman hook and generate spreadsheet"
+        help="First-time setup: install script + hook and generate spreadsheet"
     )
     args = parser.parse_args()
 

@@ -25,6 +25,7 @@ import subprocess
 import sys
 import shutil
 import argparse
+import json
 from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
@@ -44,6 +45,7 @@ PACMAN_LOG  = Path("/var/log/pacman.log")
 OUT_DIR     = Path("/var/log/pkglog")
 OUT_PATH    = OUT_DIR / "pkglog.ods"
 README_DST  = OUT_DIR / "README.md"
+PKG_CACHE   = OUT_DIR / "pkg_cache.json"
 HOOK_DIR    = Path("/etc/pacman.d/hooks")
 HOOK_PATH   = HOOK_DIR / "pkglog.hook"
 INSTALL_BIN = Path("/usr/local/bin/pkglog")
@@ -424,34 +426,65 @@ def build_history_rows(events):
 
 # ── main ───────────────────────────────────────────────────────────────────────
 
-def run(include_history=True):
+def run(include_history=True, silent=False):
     ensure_out_dir()
 
-    print("Reading official package list from pacman...")
+    if not silent:
+        print("Reading official package list from pacman...")
     official_pkgs = get_official_packages()
-    print(f"  {len(official_pkgs)} packages in official repos")
-
-    print("Reading explicitly installed packages...")
+    if not silent:
+        print(f"  {len(official_pkgs)} packages in official repos")
+        print("Reading explicitly installed packages...")
     explicit_pkgs = get_explicit_packages()
-    print(f"  {len(explicit_pkgs)} explicitly installed packages")
-
-    print(f"Parsing {PACMAN_LOG}...")
+    if not silent:
+        print(f"  {len(explicit_pkgs)} explicitly installed packages")
+        print(f"Parsing {PACMAN_LOG}...")
     events    = parse_log()
     pkg_stats = build_pkg_stats(events)
-    print(f"  {len(events)} events, {len(pkg_stats)} unique packages")
-
-    print("Classifying packages...")
+    if not silent:
+        print(f"  {len(events)} events, {len(pkg_stats)} unique packages")
+        print("Classifying packages...")
     explicit_set, aur_set, system_set = \
         classify_packages(pkg_stats, official_pkgs, explicit_pkgs)
-    print(f"  {len(explicit_set)} explicit, {len(aur_set)} AUR, "
-          f"{len(system_set)} system packages")
-
-    print("Fetching package info (versions + dependencies)...")
+    if not silent:
+        print(f"  {len(explicit_set)} explicit, {len(aur_set)} AUR, "
+              f"{len(system_set)} system packages")
+        print("Fetching package info (versions + dependencies)...")
     global _PKG_INFO_CACHE
-    _PKG_INFO_CACHE = batch_pkg_info(set(pkg_stats.keys()))
-    print(f"  {len(_PKG_INFO_CACHE)} packages queried")
 
-    print("Building spreadsheet...")
+    # load existing cache
+    disk_cache = {}
+    if PKG_CACHE.exists():
+        try:
+            disk_cache = json.loads(PKG_CACHE.read_text())
+        except Exception:
+            disk_cache = {}
+
+    # only query packages not already cached
+    all_pkgs     = set(pkg_stats.keys())
+    cached_pkgs  = set(disk_cache.keys())
+    # always re-query packages involved in this log's most recent event
+    # (their version/deps may have changed)
+    recent_pkgs  = {e["package"] for e in events[-50:]}
+    need_query   = (all_pkgs - cached_pkgs) | (recent_pkgs & all_pkgs)
+
+    if need_query:
+        fresh = batch_pkg_info(need_query)
+        disk_cache.update(fresh)
+        try:
+            PKG_CACHE.write_text(json.dumps(disk_cache))
+        except Exception:
+            pass
+        if not silent:
+            print(f"  {len(need_query)} packages queried, {len(cached_pkgs)} from cache")
+    else:
+        if not silent:
+            print(f"  {len(disk_cache)} packages loaded from cache")
+
+    _PKG_INFO_CACHE = disk_cache
+
+    if not silent:
+        print("Building spreadsheet...")
     doc = OpenDocumentSpreadsheet()
 
     exp_rows  = build_summary_rows(explicit_set, pkg_stats, show_deps=True)
@@ -485,7 +518,7 @@ def run(include_history=True):
     write_sheet(doc, "History", HISTORY_COLS, HISTORY_WIDTHS, hist_rows, HEADER_COLORS["History"])
 
     doc.save(str(OUT_PATH))
-    print(f"Saved - {OUT_PATH}")
+    print(f"pkglog updated - {OUT_PATH}")
 
 
 if __name__ == "__main__":
@@ -502,7 +535,8 @@ if __name__ == "__main__":
     elif args.update:
         if not check_dependencies():
             sys.exit(1)
-        print("""
+        if sys.stdin.isatty():
+            print("""
 Row colors in the spreadsheet:
   Green  - installed   (package was freshly installed)
   Blue   - upgraded    (package was upgraded to a newer version)
@@ -512,8 +546,11 @@ Row colors in the spreadsheet:
 Dependency rows appear indented under their parent package
 and use a lighter shade of the same color.
 """)
-        ans = input("Generate pacman/AUR history sheets? This will take more time. [y/N]: ").strip().lower()
-        run(include_history=(ans == "y"))
+            ans = input("Generate per-category history sheets? This will take more time. [y/N]: ").strip().lower()
+            run(include_history=(ans == "y"))
+        else:
+            # running from pacman hook — no terminal, skip prompt
+            run(include_history=False, silent=True)
     else:
         # default and --view: open the spreadsheet
         view()

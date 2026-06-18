@@ -62,12 +62,14 @@ git clone https://github.com/dsarisoy/pkglog
 cd pkglog
 python3 logscript.py --setup
 ```
+Once setup is run, you can delete the pkglog repo if you wish. 
 
 `--setup` will:
 1. Check that dependencies are present
 2. Install the script to `/usr/local/bin/pkglog` (prompts for sudo)
 3. Install a pacman hook to `/etc/pacman.d/hooks/pkglog.hook` (prompts for sudo)
-4. Generate the initial spreadsheet from your full pacman log history
+4. Copy the README to `/var/log/pkglog/README.md`
+5. Generate the initial spreadsheet from your full pacman log history
 
 ---
 ## File locations
@@ -77,6 +79,8 @@ python3 logscript.py --setup
 | Script | `/usr/local/bin/pkglog` |
 | Pacman hook | `/etc/pacman.d/hooks/pkglog.hook` |
 | Spreadsheet output | `/var/log/pkglog/pkglog.ods` |
+| Package info cache | `/var/log/pkglog/pkg_cache.json` |
+| README | `/var/log/pkglog/README.md` |
 | Pacman log (input) | `/var/log/pacman.log` |
 
 ---
@@ -85,24 +89,25 @@ python3 logscript.py --setup
 # First-time setup (installs script + hook + generates spreadsheet)
 python3 logscript.py --setup
 
-# Generate or refresh the spreadsheet manually
+# Open the spreadsheet in LibreOffice
 pkglog
+pkglog --view
+
+# Regenerate the spreadsheet manually
+pkglog --update
 ```
 
-Once set up, the spreadsheet regenerates automatically after every `pacman` transaction — installs, upgrades, and removals.
+Once set up, the spreadsheet regenerates automatically after every `pacman` or AUR transaction — installs, upgrades, and removals.
 
-Open the spreadsheet with:
-```bash
-libreoffice --calc /var/log/pkglog/pkglog.ods
-```
 ---
 ## How it works
 pacman writes a timestamped log of every transaction to `/var/log/pacman.log`. pkglog parses that log and classifies packages using two queries:
 - **Official vs AUR** — checked against `pacman -Slq` (all packages in the sync databases). Packages not found there are classified as AUR or manually installed.
 - **Explicit vs system** — checked against `pacman -Qqe` (explicitly installed packages). Official packages not in this list are classified as System Packages.
-- **Versions and dependencies** — resolved in a single batched `pacman -Qi` call for all packages at once.
+- **Versions and dependencies** — resolved via a batched `pacman -Qi` call and cached to `/var/log/pkglog/pkg_cache.json`. On subsequent runs only new or recently changed packages are re-queried, making hook runs significantly faster.
 
-The pacman hook (`pkglog.hook`) triggers after every transaction and reruns the script, so the spreadsheet is always up to date.
+The pacman hook (`pkglog.hook`) triggers after every transaction and runs `pkglog --update` silently in the background.
+
 ---
 ## Caveats
 - **Source detection is current-state only.** If a package was in the official repos when you installed it but has since been removed from them, it may be misclassified as AUR. This is a limitation of `pacman -Slq`.
